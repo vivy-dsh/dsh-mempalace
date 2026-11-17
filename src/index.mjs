@@ -9,6 +9,7 @@ import { retireLegacyState } from './retire.mjs'
 import { resolveSubject } from '../../_shared/subject.mjs'
 import { applyTools } from './tools.mjs'
 import { applyCommands } from './commands.mjs'
+import { createRecallInjection } from './recall/inject.mjs'
 
 export const name = 'dsh-mempalace'
 export const inject = ['webServer', 'connection']
@@ -55,18 +56,35 @@ export function apply(ctx, pluginConfig = {}) {
 
   const service = new MempalaceService({
     stateDir,
+    home,
     config,
     logger: ctx.logger,
     setupMarkerPath,
     subject: () => resolveSubject({ env: process.env, webServer: ctx.webServer }),
+    resolveKey: async ref => {
+      const credentials = ctx.get('credentials')
+      if (credentials?.resolve) {
+        const resolved = await credentials.resolve(ref)
+        if (resolved?.value) return resolved.value
+      }
+      return process.env[ref] ?? null
+    },
   })
 
   void service.ready().catch(error => {
     ctx.logger.warn(`dsh-mempalace: data layer unavailable: ${error?.message ?? error}`)
   })
 
+  const recall = createRecallInjection({
+    config: service.config,
+    recall: (text, options) => service.recallBlock(text, options),
+    logger: ctx.logger,
+  })
+  service.recallInjection = recall
+
   ctx.on('session/event', (session, event) => {
     if (event.type === 'working-directory/change') service.updateCwd(session, event.data?.cwd)
+    else recall.noteUserMessage(session, event)
   })
 
   const disposeHttp = registerMempalaceHttp(ctx, service)
@@ -84,6 +102,13 @@ export function apply(ctx, pluginConfig = {}) {
       name: 'mempalace:policy',
       order: 510,
       text: context => context.agent === undefined ? '' : POLICY,
+    })
+    // Recall is contributed from the assembly waterfall: only an accepted context
+    // reaches the durable runtime-context snapshot, and the waterfall may await the
+    // query embedding so the first step of a turn already scores with cosine.
+    child.on('system-prompt/assemble', async (assembly, context, next) => {
+      const accepted = await next()
+      return recall.contribute(accepted, context?.agent)
     })
   })
 

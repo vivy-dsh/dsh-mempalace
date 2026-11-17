@@ -12,6 +12,23 @@ import {
   estimateTokens,
   ftsQuery,
 } from './chunk.mjs'
+import {
+  DEFAULT_LOCAL_MODEL,
+  LEGACY_VEC_TABLE,
+  assertEmbeddingDim,
+  isVecTableName,
+  normalizeSpaceDescriptor,
+  parseVecTableDim,
+  spaceIdFor,
+  vecTableFor,
+} from './spaces.mjs'
+import {
+  KEYWORD_WEIGHTS,
+  RECALL_WEIGHTS,
+  lexicalSimilarity,
+  recencyScore,
+  scoreCandidate,
+} from '../recall/score.mjs'
 
 const MAX_IMPORT_ERRORS = 20
 
@@ -65,14 +82,23 @@ export class MemoryStore {
     this.memoryDir = path.resolve(options.memoryDir)
     this.embed = options.embed
     if (typeof this.embed !== 'function') throw new Error('dsh-mempalace: embed function is required')
-    this.embeddingDim = options.embeddingDim ?? EMBEDDING_DIM
-    if (this.embeddingDim !== EMBEDDING_DIM) {
-      throw new Error(`dsh-mempalace: embeddingDim must be ${EMBEDDING_DIM} for Xenova/all-MiniLM-L6-v2`)
-    }
+    this.space = normalizeSpaceDescriptor(options.space ?? {
+      source: 'local',
+      kind: '',
+      model: options.embeddingModel ?? DEFAULT_LOCAL_MODEL,
+      dim: options.embeddingDim ?? EMBEDDING_DIM,
+    })
+    // Width of the active space. Never a compile-time constant: every vector check
+    // below compares against this, so a second width (cloud) needs no new query.
+    this.embeddingDim = assertEmbeddingDim(this.space.dim)
+    this.spaceId = null
+    this.vecTable = null
+    this.spaces = new Map()
     this.chunkSize = options.chunkSize ?? CHUNK_SIZE
     this.chunkOverlap = options.chunkOverlap ?? CHUNK_OVERLAP
     this.minChunkSize = options.minChunkSize ?? MIN_CHUNK_SIZE
     this.logger = options.logger ?? console
+    this.sensitive = typeof options.sensitive === 'function' ? options.sensitive : () => false
     this.db = null
     this.opened = false
     this.opening = null
@@ -107,6 +133,7 @@ export class MemoryStore {
       this.#createSchema()
       this.#migrateLegacyColumns()
       this.#migrateArchiveColumns()
+      await this.#ensureSpaces()
       this.#prepare()
       this.#prepareFts()
       this.opened = true
@@ -195,12 +222,143 @@ export class MemoryStore {
       CREATE UNIQUE INDEX IF NOT EXISTS idx_knowledge_commits_key ON knowledge_commits(commit_key);
       CREATE INDEX IF NOT EXISTS idx_knowledge_commits_state ON knowledge_commits(knowledge_id, state);
     `)
+  }
 
-    try {
-      this.db.exec(`CREATE VIRTUAL TABLE vec_memories USING vec0(embedding float[${this.embeddingDim}])`)
-    } catch (error) {
-      if (!String(error?.message ?? error).includes('already exists')) throw error
+  /**
+   * Vector spaces and the per-space membership of each memory.
+   *
+   * `embedding_spaces` is the registry of live spaces (space id, model, width, physical
+   * table); `memory_spaces` answers "does this memory have a vector in *that* space"
+   * without trusting the single `embedded` flag. The registry is authoritative: an
+   * existing but empty `vec0` table is still a space, which keeps a half-built space
+   * from being overwritten by a different model of the same width.
+   */
+  async #ensureSpaces() {
+    const db = this.db
+    const hasRegistry = Boolean(db.prepare(
+      "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'embedding_spaces'",
+    ).get())
+    if (!hasRegistry) await this.#backupBeforeSpaceMigration()
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS embedding_spaces (
+        space_id TEXT PRIMARY KEY,
+        provider TEXT NOT NULL,
+        kind TEXT NOT NULL DEFAULT '',
+        model TEXT NOT NULL,
+        dim INTEGER NOT NULL,
+        table_name TEXT NOT NULL UNIQUE,
+        provenance TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS memory_spaces (
+        memory_rowid INTEGER NOT NULL,
+        space_id TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        PRIMARY KEY (memory_rowid, space_id)
+      );
+      CREATE INDEX IF NOT EXISTS idx_memory_spaces_space ON memory_spaces(space_id, memory_rowid);
+    `)
+    if (!hasRegistry) this.#adoptLegacySpace()
+    this.#resolveActiveSpace()
+  }
+
+  /** First run on an existing database: the current file is the rollback point. */
+  async #backupBeforeSpaceMigration() {
+    // Runs before #prepare(), so statements are not available yet.
+    const total = this.db.prepare('SELECT COUNT(*) AS cnt FROM memories').get().cnt
+    if (total === 0) return
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-')
+    const dir = path.join(this.memoryDir, 'backups')
+    fs.mkdirSync(dir, { recursive: true, mode: 0o700 })
+    const target = path.join(dir, `memories-${stamp}.db`)
+    await this.db.backup(target)
+    this.lastMigrationBackup = target
+    this.logger.info?.(`dsh-mempalace: 多空间迁移前已备份 ${target}`)
+  }
+
+  /**
+   * Adopts the pre-existing `vec_memories` table in place instead of copying rows:
+   * vec0 tables hold packed binary vectors, and a rename/copy would need a verified
+   * round-trip for no benefit. Old data keeps its exact bytes and its dimension.
+   */
+  #adoptLegacySpace() {
+    const db = this.db
+    const legacy = db.prepare(
+      "SELECT name, sql FROM sqlite_master WHERE type = 'table' AND name = ?",
+    ).get(LEGACY_VEC_TABLE)
+    if (!legacy) return
+    const dim = parseVecTableDim(legacy.sql)
+    if (!dim) {
+      this.logger.warn?.('dsh-mempalace: 旧向量表维度无法识别，已跳过收养（旧数据保留在原表）')
+      return
     }
+    // The legacy table predates the model column; when the current config asks for the
+    // local model at this width it *is* that space, otherwise record the shipped model.
+    const model = this.space.source === 'local' && this.space.dim === dim
+      ? this.space.model
+      : DEFAULT_LOCAL_MODEL
+    const descriptor = { source: 'local', kind: '', model, dim }
+    const spaceId = spaceIdFor(descriptor)
+    this.#insertSpaceRow({ spaceId, descriptor, tableName: LEGACY_VEC_TABLE, provenance: 'legacy-adopted' })
+    db.prepare(`
+      INSERT OR IGNORE INTO memory_spaces (memory_rowid, space_id, created_at)
+      SELECT m.rowid, ?, ? FROM memories m JOIN ${LEGACY_VEC_TABLE} v ON v.rowid = m.rowid
+    `).run(spaceId, new Date().toISOString())
+  }
+
+  #insertSpaceRow({ spaceId, descriptor, tableName, provenance }) {
+    this.db.prepare(`
+      INSERT INTO embedding_spaces (space_id, provider, kind, model, dim, table_name, provenance, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(spaceId, descriptor.source, descriptor.kind ?? '', descriptor.model, descriptor.dim,
+      tableName, provenance, new Date().toISOString())
+    const row = this.db.prepare('SELECT * FROM embedding_spaces WHERE space_id = ?').get(spaceId)
+    this.spaces.set(spaceId, row)
+    return row
+  }
+
+  /** Finds or creates the requested space and points the store's statements at its table. */
+  #resolveActiveSpace() {
+    const db = this.db
+    const desired = this.space
+    const spaceId = spaceIdFor(desired)
+    let row = db.prepare('SELECT * FROM embedding_spaces WHERE space_id = ?').get(spaceId)
+    if (!row) {
+      const taken = new Set(db.prepare('SELECT table_name FROM embedding_spaces').all().map(entry => entry.table_name))
+      const tableName = vecTableFor(spaceId, taken)
+      try {
+        db.exec(`CREATE VIRTUAL TABLE "${tableName}" USING vec0(embedding float[${desired.dim}])`)
+      } catch (error) {
+        throw Object.assign(new Error(`dsh-mempalace: 无法创建向量空间 ${spaceId} 的表 ${tableName}`), {
+          code: 'MEMPALACE_SPACE_CREATE_FAILED',
+          hint: `确认 sqlite-vec 已加载且 ${this.dbPath} 可写`,
+          cause: error,
+        })
+      }
+      row = this.#insertSpaceRow({ spaceId, descriptor: desired, tableName, provenance: 'created' })
+    }
+    if (!this.#vecTableExists(row.table_name)) {
+      throw Object.assign(new Error(`dsh-mempalace: 向量空间 ${spaceId} 的表 ${row.table_name} 不存在`), {
+        code: 'MEMPALACE_SPACE_MISSING',
+        hint: `从 ${path.join(this.memoryDir, 'backups')} 恢复最近的 memories-*.db，或删除该空间注册后重建索引`,
+      })
+    }
+    this.spaceId = spaceId
+    this.vecTable = row.table_name
+    this.spaces = new Map(db.prepare('SELECT * FROM embedding_spaces').all().map(entry => [entry.space_id, entry]))
+    this.space = normalizeSpaceDescriptor({
+      source: row.provider,
+      kind: row.kind,
+      model: row.model,
+      dim: Number(row.dim),
+    })
+    this.embeddingDim = this.space.dim
+  }
+
+  #vecTableExists(tableName) {
+    return Boolean(this.db.prepare(
+      "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?",
+    ).get(tableName))
   }
 
   #migrateLegacyColumns() {
@@ -208,6 +366,7 @@ export class MemoryStore {
       'ALTER TABLE memories ADD COLUMN chunk_index INTEGER DEFAULT 0',
       'ALTER TABLE memories ADD COLUMN parent_id TEXT DEFAULT NULL',
       'ALTER TABLE memories ADD COLUMN embedded INTEGER NOT NULL DEFAULT 1',
+      'ALTER TABLE memories ADD COLUMN sensitive INTEGER NOT NULL DEFAULT 0',
     ]) {
       try { this.db.exec(sql) } catch { /* column already exists */ }
     }
@@ -262,14 +421,27 @@ export class MemoryStore {
   #prepare() {
     const db = this.db
     this.stmts.insertMemory = db.prepare(`
-      INSERT INTO memories (id, content, content_hash, project, topic, source, timestamp, session_id, importance, chunk_index, parent_id, embedded)
-      VALUES (@id, @content, @content_hash, @project, @topic, @source, @timestamp, @session_id, @importance, @chunk_index, @parent_id, @embedded)
+      INSERT INTO memories (id, content, content_hash, project, topic, source, timestamp, session_id, importance, chunk_index, parent_id, embedded, sensitive)
+      VALUES (@id, @content, @content_hash, @project, @topic, @source, @timestamp, @session_id, @importance, @chunk_index, @parent_id, @embedded, @sensitive)
     `)
-    this.stmts.insertVec = db.prepare('INSERT INTO vec_memories (rowid, embedding) VALUES (?, ?)')
-    this.stmts.deleteVec = db.prepare('DELETE FROM vec_memories WHERE rowid = ?')
+    this.stmts.insertVec = db.prepare(`INSERT INTO "${this.vecTable}" (rowid, embedding) VALUES (?, ?)`)
+    this.stmts.deleteVec = db.prepare(`DELETE FROM "${this.vecTable}" WHERE rowid = ?`)
+    this.stmts.markSpace = db.prepare(
+      'INSERT OR IGNORE INTO memory_spaces (memory_rowid, space_id, created_at) VALUES (?, ?, ?)',
+    )
+    this.stmts.unmarkSpace = db.prepare('DELETE FROM memory_spaces WHERE memory_rowid = ? AND space_id = ?')
+    this.stmts.unmarkAllSpaces = db.prepare('DELETE FROM memory_spaces WHERE memory_rowid = ?')
+    this.stmts.spaceRow = db.prepare('SELECT * FROM embedding_spaces WHERE space_id = ?')
+    this.stmts.missingInSpace = db.prepare(`
+      SELECT m.rowid, m.content FROM memories m
+      WHERE m.embedded = 0 OR NOT EXISTS (
+        SELECT 1 FROM memory_spaces ms WHERE ms.memory_rowid = m.rowid AND ms.space_id = ?
+      )
+      ORDER BY m.rowid
+    `)
     this.stmts.insertArchiveMemory = db.prepare(`
-      INSERT INTO memories (id, content, content_hash, project, topic, source, timestamp, session_id, importance, chunk_index, parent_id, embedded, archive_id, archive_digest, subject_id, archive_meta)
-      VALUES (@id, @content, @content_hash, @project, @topic, @source, @timestamp, @session_id, @importance, @chunk_index, @parent_id, @embedded, @archive_id, @archive_digest, @subject_id, @archive_meta)
+      INSERT INTO memories (id, content, content_hash, project, topic, source, timestamp, session_id, importance, chunk_index, parent_id, embedded, sensitive, archive_id, archive_digest, subject_id, archive_meta)
+      VALUES (@id, @content, @content_hash, @project, @topic, @source, @timestamp, @session_id, @importance, @chunk_index, @parent_id, @embedded, @sensitive, @archive_id, @archive_digest, @subject_id, @archive_meta)
     `)
     this.stmts.findArchiveRows = db.prepare('SELECT id, archive_digest, subject_id, archive_meta FROM memories WHERE archive_id = ? ORDER BY chunk_index')
     this.stmts.findByHash = db.prepare('SELECT id FROM memories WHERE content_hash = ?')
@@ -288,13 +460,20 @@ export class MemoryStore {
       try {
         const vector = await this.embed(text)
         if (!(vector instanceof Float32Array) || vector.length !== this.embeddingDim) {
-          throw new Error(`embedding length ${vector?.length ?? 0} != ${this.embeddingDim}`)
+          throw Object.assign(
+            new Error(`embedding length ${vector?.length ?? 0} != ${this.embeddingDim} (${this.spaceId})`),
+            { code: 'MEMPALACE_SPACE_MISMATCH' },
+          )
         }
         this.lastEmbeddingError = null
+        this.lastEmbeddingErrorCode = null
         return { vector, embedded: 1 }
       } catch (error) {
         this.lastEmbeddingError = error?.message ?? String(error)
-        return { vector: new Float32Array(this.embeddingDim), embedded: 0 }
+        this.lastEmbeddingErrorCode = error?.code ?? 'MEMPALACE_EMBEDDING_FAILED'
+        // No vector at all: a zero vector would be indexed and silently poison similarity,
+        // so an un-embeddable memory stays keyword-searchable until the index is rebuilt.
+        return { vector: null, embedded: 0 }
       }
     })()
   }
@@ -303,10 +482,23 @@ export class MemoryStore {
     const insert = this.db.transaction(() => {
       const info = this.stmts.insertMemory.run(row)
       const rowid = Number(info.lastInsertRowid)
-      this.stmts.insertVec.run(BigInt(rowid), row.embedding)
+      this.#writeVector(rowid, row.embedding)
       return rowid
     })
     return insert()
+  }
+
+  /** Writes one vector plus its space membership; the caller owns the transaction. */
+  #writeVector(rowid, vector) {
+    if (!(vector instanceof Float32Array) || vector.length !== this.embeddingDim) return false
+    this.stmts.insertVec.run(BigInt(rowid), vector)
+    this.stmts.markSpace.run(rowid, this.spaceId, new Date().toISOString())
+    return true
+  }
+
+  /** Persisted sensitivity flag; a failing classifier must never block a write. */
+  #sensitiveFlag(text) {
+    try { return this.sensitive(text) ? 1 : 0 } catch { return 0 }
   }
 
   #invalidateL1() {
@@ -359,6 +551,7 @@ export class MemoryStore {
         chunk_index: 0,
         parent_id: null,
         embedded,
+        sensitive: this.#sensitiveFlag(content),
         embedding: vector,
       })
       this.#invalidateL1()
@@ -387,6 +580,7 @@ export class MemoryStore {
           chunk_index: index,
           parent_id: index === 0 ? null : parentId,
           embedded,
+          sensitive: this.#sensitiveFlag(chunk),
           embedding: vector,
         })
         stored = true
@@ -449,6 +643,7 @@ export class MemoryStore {
         chunk_index: index,
         parent_id: index === 0 ? null : parentId,
         embedded,
+        sensitive: this.#sensitiveFlag(chunk),
         embedding: vector,
         archive_id: archiveId,
         archive_digest: digest,
@@ -460,7 +655,7 @@ export class MemoryStore {
       const memoryIds = []
       for (const row of rows) {
         const info = this.stmts.insertArchiveMemory.run(row)
-        this.stmts.insertVec.run(BigInt(Number(info.lastInsertRowid)), row.embedding)
+        this.#writeVector(Number(info.lastInsertRowid), row.embedding)
         memoryIds.push(row.id)
       }
       return memoryIds
@@ -541,7 +736,7 @@ export class MemoryStore {
     const hasFilters = Boolean(project || topic)
     const candidateLimit = hasFilters ? Math.max(limit * 10, 50) : limit
     const vecRows = this.db.prepare(`
-      SELECT rowid, distance FROM vec_memories
+      SELECT rowid, distance FROM "${this.vecTable}"
       WHERE embedding MATCH ? ORDER BY distance LIMIT ?
     `).all(vector, candidateLimit)
     if (vecRows.length === 0) return []
@@ -578,7 +773,12 @@ export class MemoryStore {
     const params = [match]
     if (project) { conditions.push('m.project = ?'); params.push(project) }
     if (topic) { conditions.push('m.topic = ?'); params.push(topic) }
-    if (onlyUnembedded) conditions.push('m.embedded = 0')
+    // "not embedded" now means "has no vector in the *active* space", not "embedded = 0":
+    // a memory indexed by another model is still a keyword-only hit for this space.
+    if (onlyUnembedded) {
+      conditions.push('NOT EXISTS (SELECT 1 FROM memory_spaces ms WHERE ms.memory_rowid = m.rowid AND ms.space_id = ?)')
+      params.push(this.spaceId)
+    }
     try {
       const rows = this.db.prepare(`
         SELECT m.rowid, m.id, m.content, m.project, m.topic, m.source, m.timestamp,
@@ -611,7 +811,10 @@ export class MemoryStore {
     const params = [`%${likeEscape(text)}%`]
     if (project) { conditions.push('project = ?'); params.push(project) }
     if (topic) { conditions.push('topic = ?'); params.push(topic) }
-    if (onlyUnembedded) conditions.push('embedded = 0')
+    if (onlyUnembedded) {
+      conditions.push('NOT EXISTS (SELECT 1 FROM memory_spaces ms WHERE ms.memory_rowid = memories.rowid AND ms.space_id = ?)')
+      params.push(this.spaceId)
+    }
     const rows = this.db.prepare(`
       SELECT rowid, id, content, project, topic, source, timestamp, importance, chunk_index, parent_id
       FROM memories WHERE ${conditions.join(' AND ')}
@@ -652,9 +855,10 @@ export class MemoryStore {
     const total = this.db.prepare(`SELECT COUNT(*) AS cnt FROM memories ${where}`).get(...params).cnt
     const items = this.db.prepare(`
       SELECT id, content, project, topic, source, timestamp, session_id, importance,
-             chunk_index, parent_id, embedded
+             chunk_index, parent_id, embedded,
+             EXISTS (SELECT 1 FROM memory_spaces ms WHERE ms.memory_rowid = memories.rowid AND ms.space_id = ?) AS embedded_in_space
       FROM memories ${where} ORDER BY ${order} LIMIT ? OFFSET ?
-    `).all(...params, limit, offset)
+    `).all(this.spaceId, ...params, limit, offset)
     return { items, total, limit, offset }
   }
 
@@ -684,6 +888,103 @@ export class MemoryStore {
         similarity: 0,
       })),
     }
+  }
+
+  /**
+   * Ranked recall for prompt injection: semantic and keyword candidates scored on the
+   * four fixed signals. Sensitive rows never enter the result, and without a query
+   * vector the three remaining signals are renormalized instead of scoring cosine 0.
+   *
+   * @param query - the human message that recall answers.
+   * @param options.topK / minScore / excludeSensitive / allowVector.
+   * @returns `{query, mode, space_id, count, results}` with `score` and `signals` per row.
+   */
+  async recallRanked(query, options = {}) {
+    const text = String(query ?? '').trim()
+    if (!text) return { query: '', mode: 'none', space_id: this.spaceId, count: 0, results: [] }
+    const topK = clamp(options.topK, 1, 20, 4)
+    const minScore = clamp(options.minScore, 0, 1, 0.4)
+    const excludeSensitive = options.excludeSensitive !== false
+    const candidateLimit = Math.max(topK * 16, 48)
+    let vector = null
+    if (options.allowVector !== false) {
+      try {
+        const embedded = await this.embed(text)
+        if (embedded instanceof Float32Array && embedded.length === this.embeddingDim) {
+          vector = embedded
+        } else {
+          this.lastEmbeddingErrorCode = 'MEMPALACE_SPACE_MISMATCH'
+        }
+      } catch (error) {
+        this.lastEmbeddingError = error?.message ?? String(error)
+        this.lastEmbeddingErrorCode = error?.code ?? 'MEMPALACE_EMBEDDING_FAILED'
+      }
+    }
+    const candidates = new Map()
+    if (vector) {
+      const vecRows = this.db.prepare(`
+        SELECT rowid, distance FROM "${this.vecTable}"
+        WHERE embedding MATCH ? ORDER BY distance LIMIT ?
+      `).all(vector, candidateLimit)
+      for (const row of vecRows) candidates.set(row.rowid, distanceToSimilarity(row.distance))
+    }
+    for (const rowid of this.#keywordCandidateIds(text, candidateLimit)) {
+      if (!candidates.has(rowid)) candidates.set(rowid, 0)
+    }
+    const mode = vector ? 'hybrid' : 'keyword'
+    if (candidates.size === 0) {
+      return { query: text, mode, space_id: this.spaceId, count: 0, results: [] }
+    }
+    const placeholders = [...candidates.keys()].map(() => '?').join(',')
+    const rows = this.db.prepare(`
+      SELECT rowid, id, content, project, topic, source, timestamp, importance, sensitive
+      FROM memories WHERE rowid IN (${placeholders})
+    `).all(...candidates.keys())
+    const weights = vector ? RECALL_WEIGHTS : KEYWORD_WEIGHTS
+    const nowMs = Date.now()
+    const results = rows
+      .filter(row => !(excludeSensitive && Number(row.sensitive) === 1))
+      .map(row => {
+        const signals = {
+          cosine: candidates.get(row.rowid) ?? 0,
+          lexical: lexicalSimilarity(text, row.content),
+          importance: Number(row.importance ?? 0.5),
+          recency: recencyScore(row.timestamp, nowMs),
+        }
+        return {
+          id: row.id,
+          text: row.content,
+          project: row.project,
+          topic: row.topic,
+          source: row.source,
+          timestamp: row.timestamp,
+          score: scoreCandidate(signals, weights),
+          signals,
+        }
+      })
+      .filter(item => item.score >= minScore)
+      .sort((a, b) => b.score - a.score)
+      .slice(0, topK)
+    return { query: text, mode, space_id: this.spaceId, min_score: minScore, count: results.length, results }
+  }
+
+  /** Candidate rowids that match lexically, so recall still works with no vector at all. */
+  #keywordCandidateIds(text, limit) {
+    const match = ftsQuery(text)
+    if (this.ftsEnabled && match) {
+      try {
+        const hits = this.db.prepare(`
+          SELECT rowid FROM memories_fts WHERE memories_fts MATCH ?
+          ORDER BY bm25(memories_fts) LIMIT ?
+        `).all(match, limit).map(row => row.rowid)
+        // unicode61 keeps a whole CJK clause as one token, so a short query misses the
+        // FTS index; LIKE is the substring net that keeps recall working in Chinese.
+        if (hits.length > 0) return hits
+      } catch { /* corrupt FTS index falls through to LIKE */ }
+    }
+    return this.db.prepare(
+      "SELECT rowid FROM memories WHERE content LIKE ? ESCAPE '\\' ORDER BY timestamp DESC LIMIT ?",
+    ).all(`%${likeEscape(text)}%`, limit).map(row => row.rowid)
   }
 
   wakeup(options = {}) {
@@ -739,6 +1040,7 @@ export class MemoryStore {
 
   status() {
     const projects = this.groupedCounts('project')
+    const spaces = this.spacesStatus()
     return {
       memory_dir: this.memoryDir,
       store_path: this.dbPath,
@@ -747,7 +1049,52 @@ export class MemoryStore {
       storage_size_kb: this.getStorageSizeKb(),
       fts_enabled: this.ftsEnabled,
       embedding_error: this.lastEmbeddingError,
+      embedding_error_code: this.lastEmbeddingErrorCode,
+      space: spaces.spaces.find(entry => entry.active) ?? null,
+      spaces: spaces.spaces,
+      missing_in_active_space: spaces.missing_in_active_space,
+      migration_backup: this.lastMigrationBackup ?? null,
     }
+  }
+
+  /** Summary of every registered space plus the one this store writes to. */
+  spacesStatus() {
+    const counts = new Map(this.db.prepare(
+      'SELECT space_id, COUNT(*) AS cnt FROM memory_spaces GROUP BY space_id',
+    ).all().map(row => [row.space_id, row.cnt]))
+    const spaces = this.db.prepare('SELECT * FROM embedding_spaces ORDER BY created_at, space_id').all().map(row => ({
+      space_id: row.space_id,
+      source: row.provider,
+      kind: row.kind,
+      model: row.model,
+      dim: Number(row.dim),
+      table: row.table_name,
+      provenance: row.provenance,
+      created_at: row.created_at,
+      vectors: this.#vectorCount(row.table_name),
+      memories: counts.get(row.space_id) ?? 0,
+      active: row.space_id === this.spaceId,
+    }))
+    return {
+      active_space: this.spaceId,
+      missing_in_active_space: this.#missingInSpace(this.spaceId),
+      spaces,
+    }
+  }
+
+  #vectorCount(tableName) {
+    if (!isVecTableName(tableName) || !this.#vecTableExists(tableName)) return 0
+    try {
+      return this.db.prepare(`SELECT COUNT(*) AS cnt FROM "${tableName}"`).get().cnt
+    } catch { return 0 }
+  }
+
+  #missingInSpace(spaceId) {
+    return this.db.prepare(`
+      SELECT COUNT(*) AS cnt FROM memories m WHERE m.embedded = 0 OR NOT EXISTS (
+        SELECT 1 FROM memory_spaces ms WHERE ms.memory_rowid = m.rowid AND ms.space_id = ?
+      )
+    `).get(spaceId).cnt
   }
 
   listProjects() {
@@ -761,7 +1108,13 @@ export class MemoryStore {
     const row = this.stmts.findById.get(key)
     if (!row) throw new Error(`Memory not found: ${key}`)
     const remove = this.db.transaction(() => {
-      this.stmts.deleteVec.run(BigInt(row.rowid))
+      // A memory may hold vectors in several spaces; every one must go with it.
+      for (const entry of this.spaces.values()) {
+        if (!isVecTableName(entry.table_name)) continue
+        if (!this.#vecTableExists(entry.table_name)) continue
+        this.db.prepare(`DELETE FROM "${entry.table_name}" WHERE rowid = ?`).run(BigInt(row.rowid))
+      }
+      this.stmts.unmarkAllSpaces.run(row.rowid)
       this.stmts.deleteMemory.run(key)
     })
     remove()
@@ -1392,9 +1745,10 @@ export class MemoryStore {
     return {
       version: 1,
       exportedAt: new Date().toISOString(),
+      spaces: this.spacesStatus(),
       memories: this.db.prepare(`
         SELECT id, content, project, topic, source, timestamp, session_id, importance,
-               chunk_index, parent_id, embedded
+               chunk_index, parent_id, embedded, sensitive
         FROM memories ORDER BY timestamp ASC
       `).all(),
       entities: this.db.prepare('SELECT id, name, entity_type, properties, created_at FROM entities').all(),
@@ -1502,17 +1856,22 @@ export class MemoryStore {
   }
 
   async reindex() {
-    const rows = this.db.prepare('SELECT rowid, content FROM memories WHERE embedded = 0 ORDER BY rowid').all()
-    const result = { total: rows.length, updated: 0, failed: 0, errors: [] }
+    // Only rows without a vector in the *active* space: rows vectorized by another
+    // model stay untouched, so switching back never costs a re-embedding.
+    const rows = this.stmts.missingInSpace.all(this.spaceId)
+    const result = { total: rows.length, updated: 0, failed: 0, space_id: this.spaceId, errors: [] }
     for (const row of rows) {
       try {
         const vector = await this.embed(row.content)
         if (!(vector instanceof Float32Array) || vector.length !== this.embeddingDim) {
-          throw new Error('embedding shape mismatch')
+          throw Object.assign(
+            new Error(`embedding length ${vector?.length ?? 0} != ${this.embeddingDim}`),
+            { code: 'MEMPALACE_SPACE_MISMATCH' },
+          )
         }
         const update = this.db.transaction(() => {
           this.stmts.deleteVec.run(BigInt(row.rowid))
-          this.stmts.insertVec.run(BigInt(row.rowid), vector)
+          this.#writeVector(row.rowid, vector)
           this.db.prepare('UPDATE memories SET embedded = 1 WHERE rowid = ?').run(row.rowid)
         })
         update()
@@ -1522,6 +1881,7 @@ export class MemoryStore {
         if (result.errors.length < MAX_IMPORT_ERRORS) result.errors.push(error?.message ?? String(error))
       }
     }
+    if (result.updated > 0) this.#invalidateL1()
     return result
   }
 
@@ -1566,6 +1926,7 @@ export class MemoryStore {
             chunk_index: 0,
             parent_id: null,
             embedded: 1,
+            sensitive: this.#sensitiveFlag(memory.content),
             embedding: vector,
           })
           migrated += 1

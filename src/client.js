@@ -752,6 +752,7 @@ window.__ModuleLoader__.load({
       const [error, setError] = useState('')
       const [busy, setBusy] = useState('')
       const [importSummary, setImportSummary] = useState(null)
+      const [probe, setProbe] = useState(null)
       const fileRef = useRef(null)
       const load = useCallback(async () => {
         try {
@@ -779,6 +780,20 @@ window.__ModuleLoader__.load({
           await load()
           await refreshStatus()
         } catch (failure) { notify('error', failure.message) } finally { setBusy('') }
+      }
+      async function probeEmbedding() {
+        setBusy('probe')
+        try {
+          const data = await request('/embedding/probe', {})
+          setProbe(data.probe)
+          notify(data.probe.ok ? 'ok' : 'error',
+            data.probe.ok ? `向量探测成功：${data.probe.measuredDim} 维，${data.probe.latencyMs}ms` : `向量探测失败：${data.probe.error}`)
+          await load()
+          await refreshStatus()
+        } catch (failure) {
+          setProbe({ ok: false, error: failure.message })
+          notify('error', failure.message)
+        } finally { setBusy('') }
       }
       async function importFile(file) {
         if (!file) return
@@ -828,23 +843,85 @@ window.__ModuleLoader__.load({
           h('div', { className: 'mz-row' },
             h(Field, { label: '预览 token 上限' }, h('input', { type: 'number', min: 64, max: 8000, value: config.wakeUpMaxTokens, onChange: event => setConfig({ ...config, wakeUpMaxTokens: Number(event.target.value) }) })),
             h(Field, { label: '默认项目（留空用会话）' }, h('input', { value: config.defaultProject || '', onChange: event => setConfig({ ...config, defaultProject: event.target.value.trim() || null }) })),
-            h(Field, { label: '去重阈值' }, h('input', { type: 'number', min: 0, max: 1, step: 0.05, value: config.dedupeThreshold, onChange: event => setConfig({ ...config, dedupeThreshold: Number(event.target.value) }) })))),
+            h(Field, { label: '去重阈值' }, h('input', { type: 'number', min: 0, max: 1, step: 0.05, value: config.dedupeThreshold, onChange: event => setConfig({ ...config, dedupeThreshold: Number(event.target.value) }) }))),
+          h('div', { className: 'mz-row' },
+            h('label', { className: 'mz-check' }, toggle('recallInjectionEnabled'), '自动想起相关旧事'),
+            h('label', { className: 'mz-check' }, toggle('recallExcludeSensitive'), '自动召回跳过敏感记忆'),
+            h(Field, { label: '召回条数上限' }, h('input', { type: 'number', min: 1, max: 8, value: config.recallTopK, onChange: event => setConfig({ ...config, recallTopK: Number(event.target.value) }) })),
+            h(Field, { label: '召回阈值（0–1）' }, h('input', { type: 'number', min: 0, max: 1, step: 0.05, value: config.recallMinScore, onChange: event => setConfig({ ...config, recallMinScore: Number(event.target.value) }) })),
+            h(Field, { label: '召回文本上限（字符）' }, h('input', { type: 'number', min: 200, max: 4000, value: config.recallMaxChars, onChange: event => setConfig({ ...config, recallMaxChars: Number(event.target.value) }) }))),
+          h('p', { className: 'mz-hint' }, '召回只是把可能相关的旧事放进上下文，并标注“不是当前事实”；阈值过高会几乎不召回，过低会塞无关内容。')),
         h(Card, { title: '模型与网络' },
+          h('div', { className: 'mz-row' },
+            h(Field, { label: '向量来源' }, h('select', {
+              value: config.embeddingSource,
+              onChange: event => setConfig({ ...config, embeddingSource: event.target.value }),
+            },
+              h('option', { value: 'local' }, '本地模型'),
+              h('option', { value: 'cloud' }, '云端 / 世界网关')))),
           h('div', { className: 'mz-row' },
             h(Field, { label: '向量模型' }, h('input', { value: config.embeddingModel, onChange: event => setConfig({ ...config, embeddingModel: event.target.value }) })),
             h(Field, { label: '话题模型（留空关闭）' }, h('input', { value: config.topicModel, onChange: event => setConfig({ ...config, topicModel: event.target.value }) })),
             h(Field, { label: '模型缓存目录' }, h('input', { value: config.modelCacheDir, placeholder: '$DSH_HOME/mempalace/models', onChange: event => setConfig({ ...config, modelCacheDir: event.target.value }) })),
             h(Field, { label: 'HF 端点（镜像）' }, h('input', { value: config.hfEndpoint, placeholder: 'https://hf-mirror.com', onChange: event => setConfig({ ...config, hfEndpoint: event.target.value }) })),
             h(Field, { label: '模型加载超时（秒）' }, h('input', { type: 'number', min: 10, max: 900, value: Math.round((config.modelLoadTimeoutMs || 60000) / 1000), onChange: event => setConfig({ ...config, modelLoadTimeoutMs: Number(event.target.value) * 1000 }) }))),
+          config.embeddingSource === 'cloud'
+            ? h('div', { className: 'mz-row' },
+              h(Field, { label: '云端向量维度' }, h('input', { type: 'number', min: 64, max: 4096, value: config.cloudEmbeddingDim, onChange: event => setConfig({ ...config, cloudEmbeddingDim: Number(event.target.value) }) })),
+              h(Field, { label: '请求超时（秒）' }, h('input', { type: 'number', min: 1, max: 120, value: Math.round((config.cloudEmbeddingTimeoutMs || 15000) / 1000), onChange: event => setConfig({ ...config, cloudEmbeddingTimeoutMs: Number(event.target.value) * 1000 }) })),
+              h(Field, { label: '每批条数' }, h('input', { type: 'number', min: 1, max: 64, value: config.cloudEmbeddingBatch, onChange: event => setConfig({ ...config, cloudEmbeddingBatch: Number(event.target.value) }) })),
+              button(busy === 'probe' ? '探测中…' : '探测向量接口', probeEmbedding, { disabled: Boolean(busy) }))
+            : null,
+          probe
+            ? h('div', { className: probe.ok ? 'mz-alert' : 'mz-alert danger block' },
+              h('span', null, probe.ok
+                ? `探测成功：${probe.kind || probe.source} / ${probe.model} 返回 ${probe.measuredDim} 维，用时 ${probe.latencyMs}ms`
+                : `探测失败：${probe.error}${probe.hint ? `（${probe.hint}）` : ''}`))
+            : null,
           h('div', { className: 'mz-row' },
             h('label', { className: 'mz-check' }, toggle('keywordsFallback'), '语义不可用时使用关键字检索'),
             button('保存设置', save, { kind: 'primary', disabled: Boolean(busy) }),
             button(busy === 'warmup' ? '加载模型中…' : '预热模型', () => action('warmup', '/models/warmup', data => `模型状态：向量 ${data.result.embedding}，话题 ${data.result.topic}`), { disabled: Boolean(busy) }))),
+        h(Card, { title: '向量空间' },
+          h('div', { className: 'mz-meta' },
+            h(Badge, { kind: diagnostics?.space?.space_id ? 'ok' : 'warn' }, `活动空间 ${diagnostics?.space?.space_id || '未就绪'}`),
+            h(Badge, { kind: (diagnostics?.spaces?.length || 0) > 0 ? '' : 'warn' }, `${diagnostics?.spaces?.length || 0} 个空间`),
+            diagnostics?.embedding?.source
+              ? h(Badge, { kind: 'ok' }, `来源 ${diagnostics.embedding.source === 'cloud' ? '云端' : '本地'}`)
+              : null,
+            (diagnostics?.missing_in_active_space || 0) > 0
+              ? h(Badge, { kind: 'warn' }, `${diagnostics.missing_in_active_space} 条缺当前空间向量`)
+              : null),
+          (diagnostics?.spaces?.length || 0) === 0
+            ? h('p', { className: 'mz-hint' }, '数据层尚未就绪，暂无空间信息。')
+            : h('table', { className: 'mz-table' },
+              h('thead', null, h('tr', null,
+                h('th', null, '空间'), h('th', null, '模型'), h('th', null, '维度'),
+                h('th', null, '向量'), h('th', null, '记忆'), h('th', null, '状态'))),
+              h('tbody', null, diagnostics.spaces.map(space => h('tr', { key: space.space_id, className: space.active ? 'on' : '' },
+                h('td', null, space.space_id),
+                h('td', null, space.model),
+                h('td', null, String(space.dim)),
+                h('td', null, String(space.vectors)),
+                h('td', null, String(space.memories)),
+                h('td', null, space.active
+                  ? h(Badge, { kind: 'ok' }, '使用中')
+                  : space.provenance === 'legacy-adopted' ? '旧库迁移' : '保留'))))),
+          h('p', { className: 'mz-hint' }, '切换向量来源或维度只新建/激活一个空间，旧空间的向量和正文都保留；切回来无需重建。')),
         h(Card, { title: '诊断' },
           h('div', { className: 'mz-meta' },
             h(Badge, { kind: snapshot?.state === 'ready' ? 'ok' : 'warn' }, `数据层 ${snapshot?.state || 'unknown'}`),
             h(Badge, { kind: snapshot?.models?.embedding === 'ready' ? 'ok' : 'warn' }, `向量 ${snapshot?.models?.embedding || 'idle'}`),
-            h(Badge, { kind: snapshot?.models?.topic === 'ready' ? 'ok' : 'warn' }, `话题模型 ${snapshot?.models?.topic || 'idle'}`)),
+            h(Badge, { kind: snapshot?.models?.topic === 'ready' ? 'ok' : 'warn' }, `话题模型 ${snapshot?.models?.topic || 'idle'}`),
+            h(Badge, { kind: snapshot?.embedding?.source === 'cloud' ? 'ok' : '' }, `来源 ${snapshot?.embedding?.source === 'cloud' ? '云端' : '本地'}`),
+            snapshot?.recall?.enabled
+              ? h(Badge, { kind: 'ok' }, `召回 注入 ${snapshot.recall.injected || 0} 次 / 兜底 ${snapshot.recall.timeouts || 0} 次`)
+              : h(Badge, { kind: 'warn' }, '召回已关闭')),
+          snapshot?.models?.errorCode
+            ? h('div', { className: 'mz-alert danger block' },
+              h('span', null, `向量不可用（${snapshot.models.errorCode}）：${snapshot.models.error || '未知错误'}`),
+              snapshot.models.hint ? h('span', { className: 'mz-hint' }, snapshot.models.hint) : null)
+            : null,
           snapshot?.error ? h('div', { className: 'mz-alert danger' }, snapshot.error) : null,
           snapshot?.hint ? h('div', { className: 'mz-alert warn' }, snapshot.hint) : null,
           diagnostics?.retirement?.warnings?.length

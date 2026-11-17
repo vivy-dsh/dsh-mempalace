@@ -1,7 +1,9 @@
 import * as fs from 'node:fs'
 import * as path from 'node:path'
-import { EmbeddingService } from './store/embeddings.mjs'
+import { createEmbeddingSource } from './store/embedding_source.mjs'
 import { MemoryStore } from './store/memory_store.mjs'
+import { isSensitiveText } from './recall/sensitive.mjs'
+import { renderRecallBlock } from './recall/render.mjs'
 import { resolveProject } from './project.mjs'
 import { contentHash, normalizeProjectLabel } from './store/chunk.mjs'
 import { commitArchive, queryArchive, readArchiveRequest } from './archive.mjs'
@@ -23,12 +25,20 @@ function errorMessage(error) {
 }
 
 export class MempalaceService {
-  constructor({ stateDir, config, logger = console, setupMarkerPath = '', subject = null }) {
+  constructor({
+    stateDir, config, logger = console, setupMarkerPath = '', subject = null,
+    home = null, resolveKey = null, fetch = null, now, sleep,
+  }) {
     this.stateDir = stateDir
+    this.home = home || path.dirname(stateDir)
     this.config = config
     this.logger = logger
     this.setupMarkerPath = setupMarkerPath
     this.subject = subject
+    this.resolveKey = resolveKey || (async ref => process.env[ref] ?? null)
+    this.fetch = fetch
+    this.now = now
+    this.sleep = sleep
     this.resolvedSubject = null
     this.state = 'idle'
     this.readyError = null
@@ -37,17 +47,24 @@ export class MempalaceService {
     this.sessions = new WeakMap()
     this.embeddings = this.#createEmbeddings()
     this.store = null
+    this.recallInjection = null
   }
 
   #createEmbeddings() {
-    return new EmbeddingService({
-      modelName: this.config.embeddingModel,
-      topicModel: this.config.topicModel,
-      cacheDir: this.config.modelCacheDir || path.join(this.stateDir, 'models'),
-      hfEndpoint: this.config.hfEndpoint,
-      loadTimeoutMs: this.config.modelLoadTimeoutMs,
+    return createEmbeddingSource({
+      config: this.config,
+      home: this.home,
+      resolveKey: this.resolveKey,
+      fetch: this.fetch,
+      now: this.now,
+      sleep: this.sleep,
       logger: this.logger,
     })
+  }
+
+  /** The vector space every write currently targets. */
+  get activeSpace() {
+    return this.embeddings.space
   }
 
   #degraded(error) {
@@ -64,7 +81,8 @@ export class MempalaceService {
       const store = new MemoryStore({
         memoryDir: this.stateDir,
         embed: text => this.embeddings.embedIfReady(text),
-        embeddingDim: this.config.embeddingDim,
+        space: this.embeddings.space,
+        sensitive: text => isSensitiveText(text),
         chunkSize: this.config.chunkSize,
         chunkOverlap: this.config.chunkOverlap,
         minChunkSize: this.config.minChunkSize,
@@ -166,6 +184,33 @@ export class MempalaceService {
 
   async recall(options = {}) {
     return this.#withStore(store => store.recall(options))
+  }
+
+  /**
+   * Recalls up to `recallTopK` old memories for one user message and renders the
+   * labelled block. Never throws: a data-layer or embedding failure yields an empty
+   * block so prompt assembly can continue.
+   */
+  async recallBlock(text, options = {}) {
+    const query = String(text ?? '').trim()
+    if (!query) return { block: '', mode: 'none', count: 0, space_id: null }
+    try {
+      const ranked = await this.#withStore(store => store.recallRanked(query, {
+        allowVector: options.allowVector !== false,
+        topK: this.config.recallTopK,
+        minScore: this.config.recallMinScore,
+        excludeSensitive: this.config.recallExcludeSensitive,
+      }))
+      return {
+        block: renderRecallBlock(ranked.results, { maxChars: this.config.recallMaxChars }),
+        mode: ranked.mode,
+        count: ranked.count,
+        space_id: ranked.space_id,
+      }
+    } catch (error) {
+      this.logger.warn?.(`dsh-mempalace: 召回不可用：${errorMessage(error)}`)
+      return { block: '', mode: 'none', count: 0, space_id: null, error: errorMessage(error) }
+    }
   }
 
   async stats() {
@@ -395,6 +440,11 @@ export class MempalaceService {
     return this.embeddings.status()
   }
 
+  /** One real embedding round trip; never writes, so it is safe as a settings check. */
+  async probeEmbedding() {
+    return this.embeddings.probe()
+  }
+
   #setupDiagnostics() {
     if (!this.setupMarkerPath) return null
     try {
@@ -420,7 +470,14 @@ export class MempalaceService {
       hint: this.readyHint,
       config: publicConfig(this.config),
       models: this.embeddings.status(),
+      embedding: {
+        source: this.embeddings.source,
+        model: this.embeddings.model,
+        dim: this.embeddings.dim,
+        space: this.embeddings.space,
+      },
       diagnostics: this.#setupDiagnostics(),
+      recall: this.recallInjection?.snapshot?.() ?? { enabled: this.config.recallInjectionEnabled },
       retirement: this.#retirementReport(),
       paths: {
         stateDir: this.stateDir,
@@ -429,6 +486,9 @@ export class MempalaceService {
     }
     if (this.state === 'ready' && this.store?.opened) {
       snapshot.store = this.store.status()
+      snapshot.space = snapshot.store.space
+      snapshot.spaces = snapshot.store.spaces
+      snapshot.missing_in_active_space = snapshot.store.missing_in_active_space
       snapshot.stats = this.store.computeStats()
       snapshot.fts = { enabled: this.store.ftsEnabled }
     }
@@ -453,9 +513,29 @@ export class MempalaceService {
       || previous.modelLoadTimeoutMs !== next.modelLoadTimeoutMs
       || (previous.modelCacheDir || path.join(this.stateDir, 'models'))
         !== (next.modelCacheDir || path.join(this.stateDir, 'models'))
+    // Anything that changes the vector space itself also reopens the store: the
+    // active space's physical table and width are fixed when memoris statements are
+    // prepared, and switching them in place would mix two widths in one table.
+    const spaceChanged = previous.embeddingSource !== next.embeddingSource
+      || previous.embeddingDim !== next.embeddingDim
+      || previous.cloudEmbeddingDim !== next.cloudEmbeddingDim
     if (modelChanged) {
       await this.embeddings.dispose()
       this.embeddings = this.#createEmbeddings()
+    }
+    if (spaceChanged || modelChanged) {
+      const wasOpen = Boolean(this.store?.opened)
+      try { this.store?.close() } catch (error) {
+        this.logger.warn?.(`dsh-mempalace: close before space switch failed: ${errorMessage(error)}`)
+      }
+      this.store = null
+      this.readyPromise = null
+      if (wasOpen) {
+        this.state = 'idle'
+        try { await this.ready() } catch (error) {
+          this.logger.warn?.(`dsh-mempalace: reopen after space switch failed: ${errorMessage(error)}`)
+        }
+      }
     }
     return publicConfig(this.config)
   }

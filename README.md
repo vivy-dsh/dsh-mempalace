@@ -45,7 +45,7 @@ backups/        导入/维护前的备份
 
 默认使用 `Xenova/all-MiniLM-L6-v2`（向量）与 `Xenova/flan-t5-small`（话题推断），通过 `@huggingface/transformers` 在首次使用时下载。模型加载在后台进行，不阻塞保存与搜索：
 
-- 向量不可用时，记忆仍以零向量入库并标记 `embedded=0`
+- 向量不可用时，记忆正文仍照常入库并标记 `embedded=0`（不写占位向量）
 - 搜索自动退回 SQLite FTS5，响应中 `mode: "keyword"`，面板显示“关键字回退”
 - 话题推断失败时回退到 `general`
 - 模型恢复后可在面板或 `POST /reindex` 补齐向量
@@ -57,6 +57,29 @@ HF_ENDPOINT=https://hf-mirror.com npm run setup:mempalace -- --warm-models
 ```
 
 `modelLoadTimeoutMs` 控制显式预热的等待上限（默认 60 秒），超时只影响本次预热。
+
+## 多向量空间与云端向量
+
+同一数据库可并存多个向量空间（本地 384 维 + 云端任意维），每个空间一张 `vec0` 表，`embedding_spaces` 登记、`memory_spaces` 记录归属。旧库首次启动原地收养 `vec_memories`，并在 `backups/` 写迁移前快照。
+
+- `embeddingSource: "local" | "cloud"` 必须显式设置，插件不会自动在两者间切换。
+- 云端走世界网关的「向量化」插槽：只读 `$DSH_HOME/capability-hub/registry.json`，key 由 `ctx.credentials.resolve(authRef)` 解析（同名环境变量作为后备）。
+- 宽度不符不写向量：正文照常落库，`embedded` 留 0，状态里给 `MEMPALACE_SPACE_MISMATCH`。
+- 切来源/维度只切活动空间，旧向量与正文都保留，切回无需重建。
+
+配置键：`cloudEmbeddingDim`、`cloudEmbeddingTimeoutMs`、`cloudEmbeddingBatch`。运维与回滚步骤见仓库 [`docs/mempalace-multi-space-embedding.md`](../../docs/mempalace-multi-space-embedding.md)。
+
+## 自动召回
+
+用户消息到达后，`system-prompt/assemble` 瀑布把可能相关的旧事注入为一条 `mempalace:recall` 上下文：
+
+- 四信号打分：`0.65·cosine + 0.15·lexical + 0.10·importance + 0.10·recency`；无查询向量时后三项按 0.35 归一化。
+- 只对真人用户消息触发，子代理与 system-prompt 快照不触发；每条用户消息只注入一次，后续步骤从历史读到同一块。
+- 超过 `recallTimeoutMs` 退回关键字；再失败则本回合不注入。
+- 敏感内容（密钥、证件/银行卡/手机号、私密话题）永不自动注入。
+- 块自带 `【想起的旧事】` 页眉与「不是当前事实」页脚。
+
+开关：`recallInjectionEnabled`、`recallTopK`、`recallMinScore`、`recallMaxChars`、`recallTimeoutMs`、`recallExcludeSensitive`。
 
 ## 命令
 
@@ -103,10 +126,12 @@ GET  /memories  /rooms  /taxonomy  /graph/palace  /graph/tunnel
 GET  /knowledge/stats  /knowledge/entities  /knowledge/query  /knowledge/timeline
 GET  /knowledge/commits
 GET  /diary
+GET  /spaces  /embedding/status
 POST /search  /config
 POST /knowledge/entity  /knowledge/triple  /knowledge/invalidate
 GET  /export
 POST /import  /maintenance/vacuum  /reindex  /models/warmup
+POST /spaces/reindex  /embedding/probe
 ```
 
 `POST /memories`、`POST /memories/delete` 与 `POST /diary` 已删除，三者都返回 404；`GET /diary` 仍是只读入口。
@@ -162,7 +187,7 @@ POST /knowledge/rollback  回滚到更早的修订
 4. **知识图谱**：实体与事实 CRUD、失效、时间线，底部为只读知识版本账本
 5. **宫殿图**：项目节点与共享话题隧道（纯 SVG），可下钻
 6. **日记**：只读归档，按时间正序读取；写入已退役
-7. **设置**：话题推断、预览上限与模型设置、导入导出、vacuum、reindex、预热与诊断
+7. **设置**：话题推断与召回参数、向量来源与云端维度、向量探测、空间列表、导入导出、vacuum、reindex、预热与诊断
 
 瞬时结果用顶部 toast，字段错误就地显示，后端降级用常驻横幅；破坏性操作均需二次确认。
 
@@ -172,7 +197,12 @@ POST /knowledge/rollback  回滚到更早的修订
 
 ```sh
 node --test tests/mempalace.test.mjs tests/mempalace-retire.test.mjs tests/mempalace-knowledge.test.mjs
+node tests/mempalace-spaces.test.mjs        # 多空间、旧库收养、宽度校验
+node tests/mempalace-cloud-embedding.test.mjs  # 云端请求、重试、熔断、插槽校验
+node tests/mempalace-recall.test.mjs        # 召回打分、敏感过滤、注入与超时兜底
 ```
+
+Windows 上 `node --test tests/mempalace*.test.mjs` 会因子进程命名管道被沙箱拒绝而失败，逐个文件跑即可。
 
 测试使用确定性的假 embedder，不下载模型；原生依赖缺失时跳过数据层集成用例。`node --check` 覆盖面板与所有 `.mjs` 的语法。
 

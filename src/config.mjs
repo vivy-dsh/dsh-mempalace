@@ -18,6 +18,19 @@ export const DEFAULTS = Object.freeze({
   hfEndpoint: '',
   modelLoadTimeoutMs: 60_000,
   keywordsFallback: true,
+  // Vector space selection. Explicit on purpose: nothing here ever switches the
+  // active space on its own, because a silent switch would make old vectors
+  // incomparable while still looking searchable.
+  embeddingSource: 'local',
+  cloudEmbeddingDim: 512,
+  cloudEmbeddingTimeoutMs: 15_000,
+  cloudEmbeddingBatch: 16,
+  recallInjectionEnabled: true,
+  recallTopK: 4,
+  recallMinScore: 0.4,
+  recallMaxChars: 600,
+  recallTimeoutMs: 1200,
+  recallExcludeSensitive: true,
   archiveMaxItems: 200,
   archiveMaxBytes: 384 * 1024,
   archiveMaxContentChars: 40_000,
@@ -39,6 +52,11 @@ function integer(value, field, min, max) {
 
 function boolean(value, field) {
   if (typeof value !== 'boolean') fail(`${field} must be a boolean`)
+  return value
+}
+
+function oneOf(value, field, allowed) {
+  if (!allowed.includes(value)) fail(`${field} must be one of ${allowed.join(', ')}`)
   return value
 }
 
@@ -67,13 +85,23 @@ export function validateConfig(input) {
     chunkSize: integer(input.chunkSize, 'chunkSize', 100, 10000, 800),
     chunkOverlap: integer(input.chunkOverlap, 'chunkOverlap', 0, 9999, 100),
     minChunkSize: integer(input.minChunkSize, 'minChunkSize', 0, 10000, 50),
-    embeddingDim: integer(input.embeddingDim, 'embeddingDim', 384, 384, 384),
+    embeddingDim: integer(input.embeddingDim, 'embeddingDim', 64, 4096),
     embeddingModel: text(input.embeddingModel, 'embeddingModel'),
     topicModel: text(input.topicModel, 'topicModel', { allowEmpty: true }),
     modelCacheDir: text(input.modelCacheDir, 'modelCacheDir', { allowEmpty: true }),
     hfEndpoint: text(input.hfEndpoint, 'hfEndpoint', { allowEmpty: true }),
     modelLoadTimeoutMs: integer(input.modelLoadTimeoutMs, 'modelLoadTimeoutMs', 10_000, 900_000),
     keywordsFallback: boolean(input.keywordsFallback, 'keywordsFallback'),
+    embeddingSource: oneOf(input.embeddingSource, 'embeddingSource', ['local', 'cloud']),
+    cloudEmbeddingDim: integer(input.cloudEmbeddingDim, 'cloudEmbeddingDim', 64, 4096),
+    cloudEmbeddingTimeoutMs: integer(input.cloudEmbeddingTimeoutMs, 'cloudEmbeddingTimeoutMs', 1000, 120_000),
+    cloudEmbeddingBatch: integer(input.cloudEmbeddingBatch, 'cloudEmbeddingBatch', 1, 64),
+    recallInjectionEnabled: boolean(input.recallInjectionEnabled, 'recallInjectionEnabled'),
+    recallTopK: integer(input.recallTopK, 'recallTopK', 1, 8),
+    recallMinScore: Number(input.recallMinScore),
+    recallMaxChars: integer(input.recallMaxChars, 'recallMaxChars', 200, 4000),
+    recallTimeoutMs: integer(input.recallTimeoutMs, 'recallTimeoutMs', 100, 5000),
+    recallExcludeSensitive: boolean(input.recallExcludeSensitive, 'recallExcludeSensitive'),
     archiveMaxItems: integer(input.archiveMaxItems, 'archiveMaxItems', 1, 200, 200),
     archiveMaxBytes: integer(input.archiveMaxBytes, 'archiveMaxBytes', 1024, 384 * 1024, 384 * 1024),
     archiveMaxContentChars: integer(input.archiveMaxContentChars, 'archiveMaxContentChars', 100, 40_000, 40_000),
@@ -81,6 +109,9 @@ export function validateConfig(input) {
   }
   if (!Number.isFinite(config.dedupeThreshold) || config.dedupeThreshold < 0 || config.dedupeThreshold > 1) {
     fail('dedupeThreshold must be between 0 and 1')
+  }
+  if (!Number.isFinite(config.recallMinScore) || config.recallMinScore < 0 || config.recallMinScore > 1) {
+    fail('recallMinScore must be between 0 and 1')
   }
   if (config.chunkOverlap >= config.chunkSize) fail('chunkOverlap must be smaller than chunkSize')
   if (config.minChunkSize > config.chunkSize) fail('minChunkSize must not exceed chunkSize')

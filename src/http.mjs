@@ -50,6 +50,7 @@ function errorPayload(error) {
 function errorStatus(error) {
   if (error?.status) return error.status
   if (error?.code === 'MEMPALACE_UNAVAILABLE') return 503
+  if (error?.code === 'MEMPALACE_SPACE_MISSING') return 503
   if (error?.code === 'INVALID_ARGS') return 400
   return 400
 }
@@ -236,6 +237,10 @@ export function registerMempalaceHttp(ctx, service) {
             ok: true,
             config: snapshot.config,
             models: snapshot.models,
+            embedding: snapshot.embedding,
+            space: snapshot.space ?? null,
+            spaces: snapshot.spaces ?? [],
+            recall: snapshot.recall,
             diagnostics: snapshot.diagnostics,
             retirement: snapshot.retirement,
             paths: snapshot.paths,
@@ -275,6 +280,29 @@ export function registerMempalaceHttp(ctx, service) {
           if (!requireJson(req, fail)) return
           await readBody(req)
           return send(res, 200, { ok: true, ...await service.reindex() })
+        }
+        if (route === '/spaces' && req.method === 'GET') {
+          const snapshot = await service.statusSnapshot()
+          return send(res, 200, {
+            ok: true,
+            space: snapshot.space ?? null,
+            spaces: snapshot.spaces ?? [],
+            missing_in_active_space: snapshot.missing_in_active_space ?? 0,
+            embedding: snapshot.embedding ?? null,
+          })
+        }
+        if (route === '/spaces/reindex' && req.method === 'POST') {
+          if (!requireJson(req, fail)) return
+          await readBody(req)
+          return send(res, 200, { ok: true, ...await service.reindex() })
+        }
+        if (route === '/embedding/status' && req.method === 'GET') {
+          return send(res, 200, { ok: true, ...service.modelsStatus() })
+        }
+        if (route === '/embedding/probe' && req.method === 'POST') {
+          if (!requireJson(req, fail)) return
+          await readBody(req)
+          return send(res, 200, { ok: true, probe: await service.probeEmbedding() })
         }
         if (route === '/models/warmup' && req.method === 'POST') {
           if (!requireJson(req, fail)) return
